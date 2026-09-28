@@ -8,37 +8,67 @@ const { createClient } = require('redis');
 const PORT = process.env.PORT || 3000;
 const TIMEOUT = 4000;
 
-// Candidate hosts: REDIS_URL host, plus anything in REDIS_HOSTS (comma-separated),
-// falling back to the two names we want to compare.
-function getTargets() {
-  const targets = [];
-  let password = process.env.REDIS_PASSWORD || undefined;
-  let port = Number(process.env.REDIS_PORT || 6379);
+// Uses PROBE_* names on purpose: Kubernetes injects "service link" vars such as
+// REDIS_PORT=tcp://10.x.x.x:6379 into pods, which collide with REDIS_* names.
+function parsePort(value, fallback = 6379) {
+  if (!value) return fallback;
+  const m = String(value).match(/(\d+)\s*$/);
+  const n = m ? Number(m[1]) : NaN;
+  return n > 0 && n < 65536 ? n : fallback;
+}
 
-  if (process.env.REDIS_URL) {
+// Kubernetes sets <NAME>_SERVICE_HOST for every Service in the pod's namespace
+// that existed when the pod started. This reveals the real service names.
+function discoverServices() {
+  const services = [];
+  for (const [key, value] of Object.entries(process.env)) {
+    const m = key.match(/^(.+)_SERVICE_HOST$/);
+    if (!m || m[1] === 'KUBERNETES') continue;
+    const prefix = m[1];
+    services.push({
+      envPrefix: prefix,
+      likelyName: prefix.toLowerCase().replace(/_/g, '-'),
+      clusterIP: value,
+      port: process.env[`${prefix}_SERVICE_PORT`] || null,
+    });
+  }
+  return services;
+}
+
+function getTargets(services) {
+  const hosts = [];
+  let password = process.env.PROBE_PASSWORD || undefined;
+  let port = parsePort(process.env.PROBE_PORT);
+
+  if (process.env.PROBE_URL) {
     try {
-      const u = new URL(process.env.REDIS_URL);
-      targets.push(u.hostname);
-      if (u.port) port = Number(u.port);
+      const u = new URL(process.env.PROBE_URL);
+      hosts.push(u.hostname);
+      if (u.port) port = parsePort(u.port);
       if (u.password) password = decodeURIComponent(u.password);
     } catch (e) {
-      console.error('Invalid REDIS_URL:', e.message);
+      console.error('Invalid PROBE_URL:', e.message);
     }
   }
-  if (process.env.REDIS_HOSTS) {
-    targets.push(...process.env.REDIS_HOSTS.split(',').map(s => s.trim()).filter(Boolean));
+  if (process.env.PROBE_HOSTS) {
+    hosts.push(...process.env.PROBE_HOSTS.split(',').map(s => s.trim()).filter(Boolean));
   }
-  if (targets.length === 0) {
-    targets.push('internal-redis', 'internal-redis.app.aletcloud.com');
-  }
-  return { hosts: [...new Set(targets)], port, password };
+  // Always also try every discovered service plus the usual suspects.
+  hosts.push(...services.filter(s => /redis/i.test(s.envPrefix)).map(s => s.likelyName));
+  hosts.push('redis', 'internal-redis', 'internal-redis.app.aletcloud.com');
+  return { hosts: [...new Set(hosts)], port, password };
 }
 
 function tcpCheck(host, port) {
   return new Promise(resolve => {
     const start = Date.now();
-    const sock = net.connect({ host, port });
-    const done = result => { sock.destroy(); resolve({ ...result, ms: Date.now() - start }); };
+    let sock;
+    const done = result => { if (sock) sock.destroy(); resolve({ ...result, ms: Date.now() - start }); };
+    try {
+      sock = net.connect({ host, port });
+    } catch (err) {
+      return done({ ok: false, error: err.code || err.message });
+    }
     sock.setTimeout(TIMEOUT, () => done({ ok: false, error: 'timeout' }));
     sock.once('connect', () => done({ ok: true }));
     sock.once('error', err => done({ ok: false, error: err.code || err.message }));
@@ -50,7 +80,7 @@ async function redisCheck(host, port, password) {
     socket: { host, port, connectTimeout: TIMEOUT, reconnectStrategy: false },
     password,
   });
-  client.on('error', () => {}); // errors are surfaced via the awaited calls below
+  client.on('error', () => {});
   const start = Date.now();
   try {
     await client.connect();
@@ -81,7 +111,8 @@ async function checkHost(host, port, password) {
 }
 
 async function runChecks() {
-  const { hosts, port, password } = getTargets();
+  const services = discoverServices();
+  const { hosts, port, password } = getTargets(services);
   let resolvConf = null;
   try { resolvConf = fs.readFileSync('/etc/resolv.conf', 'utf8'); } catch {}
   const results = [];
@@ -90,7 +121,9 @@ async function runChecks() {
     time: new Date().toISOString(),
     podHostname: os.hostname(),
     passwordSet: Boolean(password),
-    resolvConf, // the "search" line reveals the pod's namespace
+    rawRedisPortEnv: process.env.REDIS_PORT || null,
+    servicesInNamespace: services,
+    resolvConf, // the "search" line shows the pod's namespace
     results,
   };
 }
@@ -100,11 +133,19 @@ http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('ok');
   }
-  const report = await runChecks();
-  res.writeHead(200, { 'Content-Type': 'application/json' });
-  res.end(JSON.stringify(report, null, 2));
+  try {
+    const report = await runChecks();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(report, null, 2));
+  } catch (err) {
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end(String(err && err.stack || err));
+  }
 }).listen(PORT, async () => {
   console.log(`redis-probe listening on ${PORT}`);
-  const report = await runChecks();
-  console.log(JSON.stringify(report, null, 2));
+  try {
+    console.log(JSON.stringify(await runChecks(), null, 2));
+  } catch (err) {
+    console.error('Startup check failed:', err);
+  }
 });
