@@ -1,0 +1,15 @@
+{
+  "name": "redis-probe",
+  "version": "1.0.0",
+  "description": "Checks DNS, TCP and Redis connectivity to candidate Redis hosts",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "redis": "^4.7.0"
+  }
+}
