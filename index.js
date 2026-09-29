@@ -128,7 +128,66 @@ async function runChecks() {
   };
 }
 
+// ---------- Outbound (egress) checks ----------
+const https = require('https');
+
+const EGRESS_TARGETS = (process.env.EGRESS_TARGETS || 'api.telegram.org,api.github.com,www.google.com')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const EGRESS_TIMEOUT = 6000;
+
+function httpsAttempt(host, family) {
+  return new Promise(resolve => {
+    const start = Date.now();
+    const req = https.request(
+      { host, path: '/', method: 'GET', family, timeout: EGRESS_TIMEOUT },
+      res => {
+        res.resume();
+        resolve({ ok: true, status: res.statusCode, ip: res.socket && res.socket.remoteAddress, ms: Date.now() - start });
+      }
+    );
+    req.on('timeout', () => req.destroy(Object.assign(new Error('timeout'), { code: 'TIMEOUT' })));
+    req.on('error', err => resolve({ ok: false, error: err.code || err.message, ms: Date.now() - start }));
+    req.end();
+  });
+}
+
+async function checkEgressTarget(host, attempts) {
+  const result = { host };
+  try {
+    const addrs = await dns.lookup(host, { all: true });
+    result.dns = addrs.map(a => `${a.address} (v${a.family})`);
+  } catch (err) {
+    result.dns = { error: err.code || err.message };
+    return result;
+  }
+  const families = [...new Set((await dns.lookup(host, { all: true })).map(a => a.family))];
+  result.byFamily = {};
+  await Promise.all(families.map(async fam => {
+    const runs = [];
+    for (let i = 0; i < attempts; i++) runs.push(await httpsAttempt(host, fam));
+    const ok = runs.filter(r => r.ok).length;
+    result.byFamily[`ipv${fam}`] = { success: `${ok}/${attempts}`, runs };
+  }));
+  return result;
+}
+
+async function runEgress(attempts) {
+  const results = await Promise.all(EGRESS_TARGETS.map(h => checkEgressTarget(h, attempts)));
+  return { time: new Date().toISOString(), podHostname: os.hostname(), attemptsPerFamily: attempts, results };
+}
+
 http.createServer(async (req, res) => {
+  if (req.url.startsWith('/egress')) {
+    const n = Number(new URL(req.url, 'http://x').searchParams.get('n')) || 5;
+    try {
+      const report = await runEgress(Math.min(Math.max(n, 1), 10));
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify(report, null, 2));
+    } catch (err) {
+      res.writeHead(500, { 'Content-Type': 'text/plain' });
+      return res.end(String(err && err.stack || err));
+    }
+  }
   if (req.url === '/health') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     return res.end('ok');
